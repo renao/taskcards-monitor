@@ -49,9 +49,17 @@ def _format_attachments(attachments: list) -> str:
     """Format attachments for display in terminal."""
     if not attachments:
         return "[dim]<none>[/dim]"
+
+    def _filename(att) -> str:
+        # Attachments may be AttachmentData objects (change display) or raw
+        # dicts from the GraphQL response (inspect/show display).
+        if isinstance(att, dict):
+            return att.get("filename", "")
+        return att.filename
+
     return (
         f"{len(attachments)} file(s): "
-        + ", ".join(att.filename for att in attachments[:3])
+        + ", ".join(_filename(att) for att in attachments[:3])
         + (" ..." if len(attachments) > 3 else "")
     )
 

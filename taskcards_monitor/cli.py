@@ -20,6 +20,7 @@ from .email_notifier import EmailNotifier
 from .fetcher import TaskCardsFetcher
 from .models import Board, Change
 from .monitor import BoardMonitor, BoardState
+from .webhook_notifier import WebhookNotifier
 
 
 @click.group()
@@ -33,6 +34,13 @@ def main():
 @main.command()
 @click.argument("board_id")
 @click.option("--token", "-t", help="View token for private/protected boards")
+@click.option(
+    "--password",
+    "-p",
+    envvar="TASKCARDS_PASSWORD",
+    default="",
+    help="Board password (or set TASKCARDS_PASSWORD env var)",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
 @click.option(
     "--email-config",
@@ -40,15 +48,31 @@ def main():
     type=click.Path(exists=True, path_type=Path),
     help="Path to email configuration YAML file",
 )
-def check(board_id: str, token: str | None, verbose: bool, email_config: Path | None):
+@click.option(
+    "--webhook-url",
+    envvar="HA_WEBHOOK_URL",
+    help="Home Assistant webhook URL for notifications (or set HA_WEBHOOK_URL env var)",
+)
+def check(
+    board_id: str,
+    token: str | None,
+    password: str,
+    verbose: bool,
+    email_config: Path | None,
+    webhook_url: str | None,
+):
     """Check a board for changes and log any differences."""
 
     if verbose:
         console.print(f"[dim]Checking board: {board_id}[/dim]")
         if token:
             console.print(f"[dim]Using view token: {token[:8]}...[/dim]")
+        if password:
+            console.print("[dim]Using board password[/dim]")
         if email_config:
             console.print(f"[dim]Email notifications enabled: {email_config}[/dim]")
+        if webhook_url:
+            console.print("[dim]Webhook notifications enabled[/dim]")
 
     # Initialize monitor
     monitor = BoardMonitor(board_id)
@@ -68,7 +92,7 @@ def check(board_id: str, token: str | None, verbose: bool, email_config: Path | 
             console.status("[bold green]Fetching board data...", spinner="dots"),
             TaskCardsFetcher() as fetcher,
         ):
-            data = fetcher.fetch_board(board_id, token=token)
+            data = fetcher.fetch_board(board_id, token=token, password=password)
 
         if verbose:
             console.print("[dim]Board data fetched successfully[/dim]")
@@ -108,6 +132,34 @@ def check(board_id: str, token: str | None, verbose: bool, email_config: Path | 
 
         except Exception as e:
             console.print(f"[bold red]Error sending email:[/bold red] {str(e)}")
+            if verbose:
+                import traceback
+
+                console.print(f"[dim]{traceback.format_exc()}[/dim]")
+            raise click.Abort() from e
+
+    # Send webhook notification if configured
+    if webhook_url:
+        try:
+            if verbose:
+                console.print("[dim]Sending webhook notification...[/dim]")
+
+            webhook_notifier = WebhookNotifier(webhook_url)
+            webhook_sent = webhook_notifier.notify_changes(
+                board_id=board_id,
+                board_name=current_state.board_name,
+                timestamp=current_state.timestamp,
+                changes=changes,
+                token=token,
+            )
+
+            if webhook_sent:
+                console.print("[green]✓[/green] Webhook notification sent")
+            elif verbose:
+                console.print("[dim]No webhook sent (no changes or first run)[/dim]")
+
+        except Exception as e:
+            console.print(f"[bold red]Error sending webhook:[/bold red] {str(e)}")
             if verbose:
                 import traceback
 
@@ -182,7 +234,14 @@ def list_boards():
 @main.command()
 @click.argument("board_id")
 @click.option("--token", "-t", help="View token for private/protected boards")
-def inspect(board_id: str, token: str | None):
+@click.option(
+    "--password",
+    "-p",
+    envvar="TASKCARDS_PASSWORD",
+    default="",
+    help="Board password (or set TASKCARDS_PASSWORD env var)",
+)
+def inspect(board_id: str, token: str | None, password: str):
     """
     Inspect a board for debugging (detailed output).
 
@@ -196,7 +255,7 @@ def inspect(board_id: str, token: str | None):
         console.print("\n[cyan]Fetching board data...[/cyan]")
 
         with TaskCardsFetcher() as fetcher:
-            data = fetcher.fetch_board(board_id, token=token)
+            data = fetcher.fetch_board(board_id, token=token, password=password)
 
         # Create state for display
         state = BoardState(data)
