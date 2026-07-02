@@ -1,18 +1,79 @@
 """Webhook notification module for TaskCards monitor.
 
-Sends a compact text message to a webhook endpoint (e.g. a Home Assistant
-webhook automation) whenever board changes are detected. The payload is JSON
-so that the receiving automation can either use the pre-rendered ``message``
-field directly or build its own text from the structured fields.
+Sends one message per changed card to a webhook endpoint (e.g. a Home Assistant
+webhook automation) whenever board changes are detected. Each message contains
+the card title, its last-modified time (de-DE / Europe/Berlin), the description
+as plain text, a hint about attachments and a link to open the board.
 """
+
+import html
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import httpx
 
 from .changes import ChangeSet
 
 
+def _berlin_offset_hours(dt_utc: datetime) -> int:
+    """Return the Europe/Berlin UTC offset (1 = MEZ, 2 = MESZ) without tzdata."""
+    year = dt_utc.year
+
+    def last_sunday_0100(month: int) -> datetime:
+        d = datetime(year, month, 31, 1, 0, tzinfo=timezone.utc)
+        while d.weekday() != 6:  # 6 = Sunday
+            d -= timedelta(days=1)
+        return d
+
+    return 2 if last_sunday_0100(3) <= dt_utc < last_sunday_0100(10) else 1
+
+
+def _format_modified(value: Any) -> str | None:
+    """Format a taskcards 'modified' value (epoch ms) as de-DE Berlin time."""
+    try:
+        ts = int(value)
+    except (TypeError, ValueError):
+        return None
+    dt_utc = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+    local = dt_utc + timedelta(hours=_berlin_offset_hours(dt_utc))
+    return local.strftime("%d.%m.%Y, %H:%M Uhr")
+
+
+def _clean_description(desc: str | None) -> str:
+    """Convert a taskcards HTML description into readable plain text."""
+    if not desc:
+        return ""
+    text = re.sub(r"(?i)<br\s*/?>", "\n", desc)
+    text = re.sub(r"(?i)</(div|p|li|h[1-6])>", "\n", text)
+    text = re.sub(r"(?i)<li[^>]*>", "• ", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    lines = [ln.strip() for ln in text.splitlines()]
+    return "\n".join(ln for ln in lines if ln)
+
+
+def _attachment_hint(attachments: list) -> str | None:
+    """Return a compact hint like '📎 3 Bilder – im Board ansehen'."""
+    if not attachments:
+        return None
+    n = len(attachments)
+
+    def _mime(a: Any) -> str:
+        if isinstance(a, dict):
+            return a.get("mimetype") or ""
+        return getattr(a, "mime_type", "") or ""
+
+    n_images = sum(1 for a in attachments if _mime(a).startswith("image/"))
+    if n_images == n:
+        label = "Bild" if n == 1 else "Bilder"
+    else:
+        label = "Anhang" if n == 1 else "Anhänge"
+    return f"📎 {n} {label} – im Board ansehen"
+
+
 class WebhookNotifier:
-    """Send webhook notifications about board changes."""
+    """Send one webhook notification per changed card."""
 
     def __init__(self, webhook_url: str, timeout: int = 30):
         """Initialize the webhook notifier.
@@ -33,8 +94,9 @@ class WebhookNotifier:
         timestamp: str,
         changes: ChangeSet,
         token: str | None = None,
+        board_state=None,
     ) -> bool:
-        """Send a webhook notification if there are changes (not on first run).
+        """Send one webhook message per changed card (not on first run).
 
         Args:
             board_id: The board identifier
@@ -42,77 +104,110 @@ class WebhookNotifier:
             timestamp: Timestamp of the check
             changes: ChangeSet from BoardMonitor.detect_changes()
             token: View token for private boards (optional)
+            board_state: Current BoardState, used to look up each card's
+                last-modified time and attachments (optional)
 
         Returns:
-            True if a notification was sent, False otherwise
+            True if at least one notification was sent, False otherwise
         """
-        # Don't notify on first run (baseline) or when nothing changed
         if changes.is_first_run or not changes.has_changes():
             return False
 
         board_url = f"https://www.taskcards.de/#/board/{board_id}/view"
         if token:
             board_url += f"?token={token}"
+        name = board_name or board_id
 
-        message = self._build_message(board_name or board_id, board_url, changes)
+        def _card(card_id: str) -> dict:
+            if board_state is not None:
+                return board_state.get_card(card_id) or {}
+            return {}
 
+        sent = 0
+
+        for card in changes.cards_added:
+            full = _card(card.id)
+            message = self._card_message(
+                icon="🆕",
+                board_name=name,
+                title=card.title,
+                modified=_format_modified(full.get("modified")),
+                description=card.description,
+                attachments=full.get("attachments") or card.attachments,
+                board_url=board_url,
+            )
+            self._post(message, board_id, name, board_url, timestamp, card.id, "added")
+            sent += 1
+
+        for card in changes.cards_modified:
+            full = _card(card.id)
+            message = self._card_message(
+                icon="✏️",
+                board_name=name,
+                title=card.new_title or card.old_title,
+                modified=_format_modified(full.get("modified")),
+                description=card.new_description,
+                attachments=full.get("attachments") or [],
+                board_url=board_url,
+            )
+            self._post(message, board_id, name, board_url, timestamp, card.id, "modified")
+            sent += 1
+
+        for card in changes.cards_removed:
+            title = card.title or "(ohne Titel)"
+            message = "\n".join(
+                [
+                    f"🗑️ {name}: Karte entfernt – {title}",
+                    "",
+                    f"🔗 Board öffnen: {board_url}",
+                ]
+            )
+            self._post(message, board_id, name, board_url, timestamp, card.id, "removed")
+            sent += 1
+
+        return sent > 0
+
+    @staticmethod
+    def _card_message(
+        icon: str,
+        board_name: str,
+        title: str | None,
+        modified: str | None,
+        description: str | None,
+        attachments: list,
+        board_url: str,
+    ) -> str:
+        """Build a single detailed card message."""
+        parts = [f"{icon} {board_name}: {title or '(ohne Titel)'}"]
+        if modified:
+            parts.append(f"🕒 {modified}")
+        desc = _clean_description(description)
+        if desc:
+            parts += ["", desc]
+        hint = _attachment_hint(attachments or [])
+        if hint:
+            parts += ["", hint]
+        parts += ["", f"🔗 Board öffnen: {board_url}"]
+        return "\n".join(parts)
+
+    def _post(
+        self,
+        message: str,
+        board_id: str,
+        board_name: str,
+        board_url: str,
+        timestamp: str,
+        card_id: str,
+        change_type: str,
+    ) -> None:
         payload = {
             "message": message,
             "board_id": board_id,
-            "board_name": board_name or board_id,
+            "board_name": board_name,
             "board_url": board_url,
             "timestamp": timestamp,
-            "added_count": len(changes.cards_added),
-            "removed_count": len(changes.cards_removed),
-            "changed_count": len(changes.cards_modified),
+            "card_id": card_id,
+            "change_type": change_type,
         }
-
         response = httpx.post(self.webhook_url, json=payload, timeout=self.timeout)
         response.raise_for_status()
-        return True
-
-    @staticmethod
-    def _build_message(board_name: str, board_url: str, changes: ChangeSet) -> str:
-        """Build a compact human-readable message describing the changes."""
-        added = len(changes.cards_added)
-        removed = len(changes.cards_removed)
-        modified = len(changes.cards_modified)
-
-        summary_parts = []
-        if added:
-            summary_parts.append(f"{added} neu")
-        if modified:
-            summary_parts.append(f"{modified} geändert")
-        if removed:
-            summary_parts.append(f"{removed} entfernt")
-        summary = ", ".join(summary_parts) if summary_parts else "Änderungen"
-
-        lines = [f"📋 TaskCards-Update: {board_name} ({summary})", ""]
-
-        for card in changes.cards_added:
-            column = f" [{card.column}]" if card.column else ""
-            lines.append(f"➕ {card.title or '(ohne Titel)'}{column}")
-
-        for card in changes.cards_modified:
-            title = card.new_title or card.old_title or "(ohne Titel)"
-            details = []
-            if card.old_title != card.new_title:
-                details.append("Titel")
-            if card.old_description != card.new_description:
-                details.append("Beschreibung")
-            if card.old_link != card.new_link:
-                details.append("Link")
-            if card.old_column != card.new_column:
-                details.append(f"Spalte: {card.old_column} → {card.new_column}")
-            if card.attachments_added or card.attachments_removed:
-                details.append("Anhänge")
-            detail_str = f" ({', '.join(details)})" if details else ""
-            lines.append(f"✏️ {title}{detail_str}")
-
-        for card in changes.cards_removed:
-            lines.append(f"➖ {card.title or '(ohne Titel)'}")
-
-        lines.append("")
-        lines.append(board_url)
-
-        return "\n".join(lines)

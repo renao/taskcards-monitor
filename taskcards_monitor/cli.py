@@ -151,6 +151,7 @@ def check(
                 timestamp=current_state.timestamp,
                 changes=changes,
                 token=token,
+                board_state=current_state,
             )
 
             if webhook_sent:
